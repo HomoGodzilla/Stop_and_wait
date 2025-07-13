@@ -60,7 +60,6 @@ static inline void init_random() {
     srand(time(NULL));
 }
 
-// Agora aceita a probabilidade como argumento
 static inline bool simulate_loss(double probability) {
     if (probability <= 0.0) return false;
     double r = (double)rand() / RAND_MAX;
