@@ -1,3 +1,4 @@
+// client.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,46 +6,89 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <errno.h> // Para EWOULDBLOCK
+#include <errno.h>
+#include <getopt.h>
+#include <libgen.h> // Para basename()
 
-// Inclua aqui as definições de Packet, ACKPacket, etc. e as funções auxiliares
-#include "protocol_defs.h" // Arquivo com as structs e funções auxiliares
+#include "protocol_defs.h"
 
-#define SERVER_IP "127.0.0.1" // IP do servidor
+#define SERVER_IP "127.0.0.1"
 #define SERVER_PORT 12345
-#define TIMEOUT_SEC 2       // Tempo limite de espera por ACK em segundos
-#define MAX_RETRIES 5       // Número máximo de retransmissões
+#define TIMEOUT_SEC 2
+#define MAX_RETRIES 5
+
+// Variáveis globais para configuração
+bool verbose_mode = false;
+double loss_probability = 0.0;
+
+void print_usage(const char *prog_name) {
+    fprintf(stderr, "Uso: %s <caminho_do_arquivo> [-v] [-l prob]\n", prog_name);
+    fprintf(stderr, "  -v, --verbose          Ativa o modo de log detalhado.\n");
+    fprintf(stderr, "  -l, --loss <prob>      Define a probabilidade de perda (0.0 a 1.0).\n");
+}
+
+// Wrapper para logs verbosos
+void verbose_log(const char *format, ...) {
+    if (verbose_mode) {
+        va_list args;
+        va_start(args, format);
+        vprintf(format, args);
+        va_end(args);
+    }
+}
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        fprintf(stderr, "Uso: %s <caminho_do_arquivo>\n", argv[0]);
-        exit(EXIT_FAILURE);
+    char *filepath = NULL;
+
+    // Parsing de argumentos da linha de comando
+    const struct option long_options[] = {
+        {"verbose", no_argument, 0, 'v'},
+        {"loss", required_argument, 0, 'l'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "vl:", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'v':
+                verbose_mode = true;
+                break;
+            case 'l':
+                loss_probability = atof(optarg);
+                if (loss_probability < 0.0 || loss_probability > 1.0) {
+                    fprintf(stderr, "Erro: A probabilidade de perda deve ser entre 0.0 e 1.0\n");
+                    return EXIT_FAILURE;
+                }
+                break;
+            default:
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+        }
     }
+
+    if (optind >= argc) {
+        fprintf(stderr, "Erro: Caminho do arquivo não especificado.\n");
+        print_usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    filepath = argv[optind];
 
     int sockfd;
     struct sockaddr_in server_addr;
-    char buffer[sizeof(Packet)];
     FILE *input_file;
 
-    // Para estatísticas
     long long total_packets_sent = 0;
     long long total_retransmissions = 0;
     time_t start_time, end_time;
 
-    // Para controle de sequência do cliente
-    uint8_t sequence_to_send = 0;
+    init_random();
 
-    init_random(); // Inicializa para simulação de perda
-
-    // 1. Criar socket UDP
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket creation failed");
         exit(EXIT_FAILURE);
     }
 
     memset(&server_addr, 0, sizeof(server_addr));
-
-    // Configurar endereço do servidor
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(SERVER_PORT);
     if (inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr) <= 0) {
@@ -53,77 +97,117 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Configurar timeout para o socket (para recvfrom)
     struct timeval tv;
     tv.tv_sec = TIMEOUT_SEC;
     tv.tv_usec = 0;
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv) < 0) {
-        perror("setsockopt SO_RCVTIMEO failed");
+        perror("setsockopt failed");
         close(sockfd);
         exit(EXIT_FAILURE);
     }
 
-    // Abrir arquivo para leitura
-    input_file = fopen(argv[1], "rb");
+    input_file = fopen(filepath, "rb");
     if (!input_file) {
         perror("Error opening input file");
         close(sockfd);
         exit(EXIT_FAILURE);
     }
+    
+    char* filename = basename(filepath);
 
-    printf("Iniciando transferência do arquivo '%s' para %s:%d...\n",
-           argv[1], SERVER_IP, SERVER_PORT);
-    time(&start_time); // Inicia o timer de transferência
+    printf("Iniciando transferência do arquivo '%s' para %s:%d...\n", filename, SERVER_IP, SERVER_PORT);
+    if(verbose_mode) printf("Modo Verbose Ativado. Probabilidade de Perda: %.2f%%\n", loss_probability * 100);
 
+    time(&start_time);
+
+    // 1. Enviar pacote de START de forma confiável
+    StartPacket start_pkt;
+    start_pkt.header.type = PKT_START;
+    start_pkt.header.length = strlen(filename);
+    strncpy(start_pkt.filename, filename, MAX_FILENAME_SIZE);
+    start_pkt.filename[MAX_FILENAME_SIZE] = '\0';
+    start_pkt.header.checksum = calculate_checksum(start_pkt.filename, start_pkt.header.length);
+
+    int retries = 0;
+    bool start_acked = false;
+    do {
+        verbose_log("[CLIENT] Enviando pacote START para o arquivo '%s'. Tentativa: %d\n", filename, retries + 1);
+        
+        if (!simulate_loss(loss_probability)) {
+            sendto(sockfd, &start_pkt, sizeof(PacketHeader) + start_pkt.header.length, 0,
+                   (const struct sockaddr *)&server_addr, sizeof(server_addr));
+        } else {
+             verbose_log("[CLIENT] >> Simulação de perda do pacote START.\n");
+        }
+        total_packets_sent++;
+
+        char ack_recv_buffer[sizeof(ACKPacket)];
+        ssize_t n_ack = recvfrom(sockfd, ack_recv_buffer, sizeof(ACKPacket), 0, NULL, NULL);
+
+        if (n_ack > 0) {
+            ACKPacket ack_pkt;
+            memcpy(&ack_pkt, ack_recv_buffer, n_ack);
+            if (ack_pkt.type == PKT_ACK) { // ACK para START não tem sequence_num
+                verbose_log("[CLIENT] ACK para START recebido.\n");
+                start_acked = true;
+            }
+        } else {
+            verbose_log("[CLIENT] TIMEOUT! Nenhum ACK recebido para o pacote START.\n");
+            total_retransmissions++;
+            retries++;
+        }
+    } while (!start_acked && retries < MAX_RETRIES);
+
+    if (!start_acked) {
+        fprintf(stderr, "ERRO: Servidor não respondeu ao início da transmissão. Abortando.\n");
+        fclose(input_file);
+        close(sockfd);
+        return EXIT_FAILURE;
+    }
+
+
+    // 2. Enviar dados do arquivo
     Packet data_pkt;
     ACKPacket ack_pkt;
     ssize_t bytes_read;
-    int retries;
+    uint8_t sequence_to_send = 0;
 
     while (true) {
-        // Preparar o pacote de dados
-        data_pkt.header.type = PKT_DATA;
-        data_pkt.header.sequence_num = sequence_to_send;
-
-        // Ler um bloco do arquivo
         bytes_read = fread(data_pkt.payload, 1, MAX_PAYLOAD_SIZE, input_file);
-        data_pkt.header.length = bytes_read;
-
+        
+        if (bytes_read == 0 && feof(input_file)) {
+            break; // Fim do arquivo
+        }
         if (bytes_read == 0 && !feof(input_file)) {
             perror("Error reading file");
             break;
         }
 
-        // Calcular checksum (se implementado)
+        data_pkt.header.type = PKT_DATA;
+        data_pkt.header.sequence_num = sequence_to_send;
+        data_pkt.header.length = bytes_read;
         data_pkt.header.checksum = calculate_checksum(data_pkt.payload, data_pkt.header.length);
-
-        // Serializar o pacote para o buffer
-        memcpy(buffer, &data_pkt, sizeof(PacketHeader) + data_pkt.header.length); // Simplificado
 
         retries = 0;
         bool ack_received = false;
-
         do {
-            printf("[CLIENT] Enviando pacote de DADOS (seq: %d, len: %d). Retries: %d\n",
-                   data_pkt.header.sequence_num, data_pkt.header.length, retries);
+            verbose_log("[CLIENT] Enviando pacote de DADOS (seq: %d, len: %u). Tentativa: %d\n",
+                   data_pkt.header.sequence_num, data_pkt.header.length, retries + 1);
 
-            if (simulate_loss()) {
-                printf("[CLIENT] Simulating loss of DATA packet (seq: %d).\n", data_pkt.header.sequence_num);
-                // Não enviamos, mas agimos como se tivéssemos enviado para o timer expirar
-            } else {
-                sendto(sockfd, buffer, sizeof(PacketHeader) + data_pkt.header.length, 0,
+            if (!simulate_loss(loss_probability)) {
+                sendto(sockfd, &data_pkt, sizeof(PacketHeader) + data_pkt.header.length, 0,
                        (const struct sockaddr *)&server_addr, sizeof(server_addr));
+            } else {
+                verbose_log("[CLIENT] >> Simulação de perda do pacote de DADOS (seq: %d).\n", data_pkt.header.sequence_num);
             }
             total_packets_sent++;
 
-            // Esperar por ACK
             char ack_recv_buffer[sizeof(ACKPacket)];
             ssize_t n_ack = recvfrom(sockfd, ack_recv_buffer, sizeof(ACKPacket), 0, NULL, NULL);
 
             if (n_ack < 0) {
                 if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                    printf("[CLIENT] TIMEOUT! Nenhum ACK recebido para pacote (seq: %d).\n",
-                           data_pkt.header.sequence_num);
+                    verbose_log("[CLIENT] TIMEOUT! Nenhum ACK para pacote (seq: %d).\n", data_pkt.header.sequence_num);
                     total_retransmissions++;
                     retries++;
                 } else {
@@ -131,22 +215,20 @@ int main(int argc, char *argv[]) {
                     break;
                 }
             } else {
-                // Simular perda de ACK recebido no cliente
-                if (simulate_loss()) {
-                    printf("[CLIENT] Simulating loss of received ACK (seq: %d).\n", sequence_to_send);
+                if (simulate_loss(loss_probability)) {
+                    verbose_log("[CLIENT] >> Simulação de perda do ACK recebido para (seq: %d).\n", sequence_to_send);
                     total_retransmissions++;
                     retries++;
-                    continue; // Pular para próxima tentativa se ACK for perdido
+                    continue;
                 }
-
-                // Deserializar o ACK
-                memcpy(&ack_pkt, ack_recv_buffer, n_ack); // Simplificado
+                
+                memcpy(&ack_pkt, ack_recv_buffer, n_ack);
 
                 if (ack_pkt.type == PKT_ACK && ack_pkt.sequence_num == sequence_to_send) {
-                    printf("[CLIENT] ACK recebido para pacote (seq: %d).\n", ack_pkt.sequence_num);
+                    verbose_log("[CLIENT] ACK recebido para pacote (seq: %d).\n", ack_pkt.sequence_num);
                     ack_received = true;
                 } else {
-                    printf("[CLIENT] ACK inesperado recebido (seq: %d, tipo: %d). Esperava seq: %d. Retransmitindo.\n",
+                    verbose_log("[CLIENT] ACK inesperado (seq: %d, tipo: %d). Esperava seq: %d. Retransmitindo.\n",
                            ack_pkt.sequence_num, ack_pkt.type, sequence_to_send);
                     total_retransmissions++;
                     retries++;
@@ -155,48 +237,38 @@ int main(int argc, char *argv[]) {
         } while (!ack_received && retries < MAX_RETRIES);
 
         if (!ack_received) {
-            fprintf(stderr, "ERRO: Número máximo de retransmissões excedido para pacote (seq: %d). Abortando.\n",
+            fprintf(stderr, "ERRO: Máximo de retransmissões excedido para pacote (seq: %d). Abortando.\n",
                     data_pkt.header.sequence_num);
-            break;
+            goto cleanup;
         }
 
-        // Inverter o número de sequência para o próximo pacote
         sequence_to_send = 1 - sequence_to_send;
-
-        // Se chegamos ao fim do arquivo, sair do loop
-        if (feof(input_file)) {
-            break;
-        }
     }
 
-    // Enviar pacote de FIM DE TRANSMISSÃO (EOT)
-    // O EOT também deve ser confiável, então implementamos um loop de retransmissão similar
+    // 3. Enviar pacote de FIM DE TRANSMISSÃO (EOT)
     data_pkt.header.type = PKT_EOT;
-    data_pkt.header.sequence_num = sequence_to_send; // O último sequence_to_send usado
-    data_pkt.header.length = 0; // Nenhum dado
-    data_pkt.header.checksum = 0; // Ou calcule um checksum para o header
-
-    memcpy(buffer, &data_pkt, sizeof(PacketHeader)); // Serializar apenas o cabeçalho
+    data_pkt.header.sequence_num = sequence_to_send;
+    data_pkt.header.length = 0;
+    data_pkt.header.checksum = 0;
 
     retries = 0;
     bool eot_acked = false;
     do {
-        printf("[CLIENT] Enviando pacote EOT (seq: %d). Retries: %d\n", data_pkt.header.sequence_num, retries);
-        if (simulate_loss()) {
-            printf("[CLIENT] Simulating loss of EOT packet.\n");
-        } else {
-            sendto(sockfd, buffer, sizeof(PacketHeader), 0,
+        verbose_log("[CLIENT] Enviando pacote EOT (seq: %d). Tentativa: %d\n", data_pkt.header.sequence_num, retries + 1);
+        if (!simulate_loss(loss_probability)) {
+            sendto(sockfd, &data_pkt.header, sizeof(PacketHeader), 0,
                    (const struct sockaddr *)&server_addr, sizeof(server_addr));
+        } else {
+            verbose_log("[CLIENT] >> Simulação de perda do pacote EOT.\n");
         }
-        total_packets_sent++; // Conta o EOT também
+        total_packets_sent++;
 
         char ack_recv_buffer[sizeof(ACKPacket)];
         ssize_t n_ack = recvfrom(sockfd, ack_recv_buffer, sizeof(ACKPacket), 0, NULL, NULL);
 
         if (n_ack < 0) {
             if (errno == EWOULDBLOCK || errno == EAGAIN) {
-                printf("[CLIENT] TIMEOUT! Nenhum ACK recebido para EOT (seq: %d).\n",
-                       data_pkt.header.sequence_num);
+                verbose_log("[CLIENT] TIMEOUT! Nenhum ACK para EOT (seq: %d).\n", data_pkt.header.sequence_num);
                 total_retransmissions++;
                 retries++;
             } else {
@@ -204,19 +276,19 @@ int main(int argc, char *argv[]) {
                 break;
             }
         } else {
-            if (simulate_loss()) {
-                printf("[CLIENT] Simulating loss of received ACK for EOT.\n");
+             if (simulate_loss(loss_probability)) {
+                verbose_log("[CLIENT] >> Simulação de perda do ACK para EOT.\n");
                 total_retransmissions++;
                 retries++;
                 continue;
             }
-
+            
             memcpy(&ack_pkt, ack_recv_buffer, n_ack);
             if (ack_pkt.type == PKT_ACK && ack_pkt.sequence_num == data_pkt.header.sequence_num) {
-                printf("[CLIENT] ACK de EOT recebido para (seq: %d).\n", ack_pkt.sequence_num);
+                verbose_log("[CLIENT] ACK de EOT recebido (seq: %d).\n", ack_pkt.sequence_num);
                 eot_acked = true;
             } else {
-                 printf("[CLIENT] ACK inesperado para EOT (seq: %d). Retransmitindo EOT.\n", ack_pkt.sequence_num);
+                 verbose_log("[CLIENT] ACK inesperado para EOT (seq: %d). Retransmitindo.\n", ack_pkt.sequence_num);
                  total_retransmissions++;
                  retries++;
             }
@@ -227,17 +299,23 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "AVISO: Falha ao confirmar EOT após retransmissões.\n");
     }
 
+cleanup:
     fclose(input_file);
     close(sockfd);
 
-    time(&end_time); // Finaliza o timer de transferência
+    time(&end_time);
+    double total_time = difftime(end_time, start_time);
+    if (total_time < 1) total_time = 1; // Evitar divisão por zero
 
     printf("\n--- Estatísticas do Cliente ---\n");
-    printf("Tempo total de transferência: %.2f segundos\n", difftime(end_time, start_time));
-    printf("Total de pacotes enviados (incl. EOT): %lld\n", total_packets_sent);
-    printf("Total de retransmissões: %lld\n", total_retransmissions);
-    printf("Taxa de retransmissão: %.2f%%\n", (double)total_retransmissions / (total_packets_sent - 1) * 100); // Sem contar EOT na base
     printf("Transferência concluída.\n");
+    printf("Tempo total de transferência: %.2f segundos\n", total_time);
+    printf("Total de pacotes (START/DATA/EOT) enviados: %lld\n", total_packets_sent);
+    printf("Total de retransmissões: %lld\n", total_retransmissions);
+    if (total_packets_sent > 1) {
+       printf("Taxa de retransmissão: %.2f%%\n", (double)total_retransmissions / (total_packets_sent) * 100);
+    }
+    printf("----------------------------------\n");
 
     return 0;
 }

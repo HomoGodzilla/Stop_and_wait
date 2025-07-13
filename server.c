@@ -1,3 +1,4 @@
+// server.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,30 +7,72 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <getopt.h>
 
-// Inclua aqui as definições de Packet, ACKPacket, etc. e as funções auxiliares
-#include "protocol_defs.h" // Arquivo com as structs e funções auxiliares
+#include "protocol_defs.h"
 
 #define SERVER_PORT 12345
 #define BUFFER_SIZE (sizeof(Packet))
 
-int main() {
+// Variáveis globais para configuração
+bool verbose_mode = false;
+double loss_probability = 0.0;
+
+void print_usage(const char *prog_name) {
+    fprintf(stderr, "Uso: %s [-v] [-l prob]\n", prog_name);
+    fprintf(stderr, "  -v, --verbose          Ativa o modo de log detalhado.\n");
+    fprintf(stderr, "  -l, --loss <prob>      Define a probabilidade de perda (0.0 a 1.0).\n");
+}
+
+// Wrapper para logs verbosos
+void verbose_log(const char *format, ...) {
+    if (verbose_mode) {
+        va_list args;
+        va_start(args, format);
+        vprintf(format, args);
+        va_end(args);
+    }
+}
+
+int main(int argc, char *argv[]) {
+    // Parsing de argumentos da linha de comando
+    const struct option long_options[] = {
+        {"verbose", no_argument, 0, 'v'},
+        {"loss", required_argument, 0, 'l'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, "vl:", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'v':
+                verbose_mode = true;
+                break;
+            case 'l':
+                loss_probability = atof(optarg);
+                if (loss_probability < 0.0 || loss_probability > 1.0) {
+                    fprintf(stderr, "Erro: A probabilidade de perda deve ser entre 0.0 e 1.0\n");
+                    return EXIT_FAILURE;
+                }
+                break;
+            default:
+                print_usage(argv[0]);
+                return EXIT_FAILURE;
+        }
+    }
+
     int sockfd;
     struct sockaddr_in server_addr, client_addr;
     socklen_t addr_len = sizeof(client_addr);
     char buffer[BUFFER_SIZE];
-    FILE *output_file;
+    FILE *output_file = NULL;
 
-    // Para estatísticas
     long long total_packets_received = 0;
     long long duplicate_packets = 0;
+    long long corrupted_packets = 0;
 
-    // Para controle de sequência do servidor
-    uint8_t expected_sequence = 0;
+    init_random();
 
-    init_random(); // Inicializa para simulação de perda
-
-    // 1. Criar socket UDP
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket creation failed");
         exit(EXIT_FAILURE);
@@ -38,12 +81,10 @@ int main() {
     memset(&server_addr, 0, sizeof(server_addr));
     memset(&client_addr, 0, sizeof(client_addr));
 
-    // Configurar endereço do servidor
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY; // Aceita de qualquer IP
+    server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(SERVER_PORT);
 
-    // 2. Vincular socket ao endereço e porta
     if (bind(sockfd, (const struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind failed");
         close(sockfd);
@@ -51,18 +92,10 @@ int main() {
     }
 
     printf("Servidor UDP ouvindo na porta %d...\n", SERVER_PORT);
+    if(verbose_mode) printf("Modo Verbose Ativado. Probabilidade de Perda: %.2f%%\n", loss_probability * 100);
 
-    // Abrir arquivo para escrita (Ex: "received_file.txt")
-    output_file = fopen("received_file.txt", "wb");
-    if (!output_file) {
-        perror("Error opening output file");
-        close(sockfd);
-        exit(EXIT_FAILURE);
-    }
-
-    Packet received_pkt;
-    ACKPacket ack_pkt;
-    char ack_buffer[sizeof(ACKPacket)];
+    bool receiving_data = false;
+    uint8_t expected_sequence = 0;
 
     while (true) {
         ssize_t n = recvfrom(sockfd, buffer, BUFFER_SIZE, 0,
@@ -72,86 +105,117 @@ int main() {
             perror("recvfrom failed");
             continue;
         }
-
-        // Simular perda de pacote recebido (opcional, mas bom para testes)
-        if (simulate_loss()) {
-            printf("[SERVER] Simulating loss of received packet (seq: %d).\n", expected_sequence);
-            continue; // age como se nunca tivesse recebido o pacote
-        }
-
-        // Deserializar o buffer para a estrutura do pacote
-        // Você precisará de uma função para isso, e.g., deserialize_packet(buffer, &received_pkt);
-        // Exemplo simplificado:
-        memcpy(&received_pkt, buffer, n);
-
-        // Verificar o checksum (se implementado)
-        uint16_t calculated_chksum = calculate_checksum(received_pkt.payload, received_pkt.header.length);
-        if (calculated_chksum != received_pkt.header.checksum) {
-            printf("[SERVER] Pacote corrompido detectado (seq: %d). Descartando.\n", received_pkt.header.sequence_num);
-            // Mesmo que corrompido, pode ser útil enviar um ACK para o último pacote bom
-            // Para Stop-and-Wait, o cliente retransmitirá se não receber ACK
+        
+        if (simulate_loss(loss_probability)) {
+            verbose_log("[SERVER] >> Simulação de perda de pacote recebido.\n");
             continue;
         }
 
-        total_packets_received++;
+        PacketHeader *header = (PacketHeader *)buffer;
+        
+        // Tratar pacotes START
+        if (header->type == PKT_START) {
+            StartPacket *start_pkt = (StartPacket *)buffer;
+            uint16_t calculated_chksum = calculate_checksum(start_pkt->filename, start_pkt->header.length);
 
-        if (received_pkt.header.type == PKT_DATA) {
-            if (received_pkt.header.sequence_num == expected_sequence) {
-                printf("[SERVER] Recebido pacote de DADOS (seq: %d, len: %d).\n",
-                       received_pkt.header.sequence_num, received_pkt.header.length);
+            if (calculated_chksum != start_pkt->header.checksum) {
+                verbose_log("[SERVER] Pacote START corrompido. Descartando.\n");
+                corrupted_packets++;
+                continue;
+            }
 
-                // Escrever no arquivo
-                fwrite(received_pkt.payload, 1, received_pkt.header.length, output_file);
+            char filename[MAX_FILENAME_SIZE + 1];
+            strncpy(filename, start_pkt->filename, start_pkt->header.length);
+            filename[start_pkt->header.length] = '\0';
+            
+            printf("Recebendo arquivo: %s\n", filename);
 
-                // Inverter o número de sequência esperado para o próximo
+            output_file = fopen(filename, "wb");
+            if (!output_file) {
+                perror("Error opening output file");
+                close(sockfd);
+                exit(EXIT_FAILURE);
+            }
+
+            // Enviar ACK para START
+            ACKPacket ack_pkt;
+            ack_pkt.type = PKT_ACK;
+            ack_pkt.sequence_num = 0; // Não relevante para START
+            sendto(sockfd, &ack_pkt, sizeof(ACKPacket), 0, (const struct sockaddr *)&client_addr, addr_len);
+            verbose_log("[SERVER] Enviado ACK para START.\n");
+            
+            receiving_data = true;
+            expected_sequence = 0; // Inicia a sequência de dados
+            continue;
+        }
+
+        if (!receiving_data) {
+            verbose_log("[SERVER] Aguardando pacote START. Pacote recebido descartado.\n");
+            continue;
+        }
+        
+        // Tratar pacotes de DADOS
+        if (header->type == PKT_DATA) {
+            Packet *data_pkt = (Packet *)buffer;
+            uint16_t calculated_chksum = calculate_checksum(data_pkt->payload, data_pkt->header.length);
+
+            if (calculated_chksum != data_pkt->header.checksum) {
+                verbose_log("[SERVER] Pacote de DADOS corrompido (seq: %d). Descartando.\n", data_pkt->header.sequence_num);
+                corrupted_packets++;
+                continue;
+            }
+            
+            total_packets_received++;
+            
+            if (data_pkt->header.sequence_num == expected_sequence) {
+                verbose_log("[SERVER] Recebido pacote de DADOS (seq: %d, len: %u).\n",
+                       data_pkt->header.sequence_num, data_pkt->header.length);
+
+                fwrite(data_pkt->payload, 1, data_pkt->header.length, output_file);
                 expected_sequence = 1 - expected_sequence;
 
             } else {
-                // Pacote duplicado ou fora de ordem (para Stop-and-Wait, só duplicado)
-                printf("[SERVER] Recebido pacote duplicado ou fora de ordem (seq: %d). Esperava %d. Descartando.\n",
-                       received_pkt.header.sequence_num, expected_sequence);
+                verbose_log("[SERVER] Pacote duplicado (seq: %d). Esperava %d. Descartando.\n",
+                       data_pkt->header.sequence_num, expected_sequence);
                 duplicate_packets++;
-                // Mesmo se duplicado, enviar ACK para o pacote esperado (o que já foi recebido)
-                // Isso informa ao cliente que o ACK foi perdido e ele pode parar a retransmissão
             }
 
-            // Enviar ACK para o pacote recebido (seja ele esperado ou duplicado)
-            // O ACK deve ser para o pacote que o cliente *enviou*, não o que esperamos
-            // No Stop-and-Wait, isso geralmente significa enviar o ACK do seq_num do pacote recebido
+            // Sempre envia ACK para o pacote que chegou, para o cliente não ficar em timeout
+            ACKPacket ack_pkt;
             ack_pkt.type = PKT_ACK;
-            ack_pkt.sequence_num = received_pkt.header.sequence_num; // ACK para o pacote que chegou
+            ack_pkt.sequence_num = data_pkt->header.sequence_num;
 
-            // Serializar o ACK para o buffer
-            memcpy(ack_buffer, &ack_pkt, sizeof(ACKPacket)); // Simplificado
-
-            if (simulate_loss()) {
-                printf("[SERVER] Simulating loss of ACK (seq: %d).\n", ack_pkt.sequence_num);
+            if (!simulate_loss(loss_probability)) {
+                sendto(sockfd, &ack_pkt, sizeof(ACKPacket), 0, (const struct sockaddr *)&client_addr, addr_len);
+                verbose_log("[SERVER] Enviado ACK para pacote (seq: %d).\n", ack_pkt.sequence_num);
             } else {
-                sendto(sockfd, ack_buffer, sizeof(ACKPacket), 0,
-                       (const struct sockaddr *)&client_addr, addr_len);
-                printf("[SERVER] Enviado ACK para pacote (seq: %d).\n", ack_pkt.sequence_num);
+                verbose_log("[SERVER] >> Simulação de perda do ACK (para seq: %d).\n", ack_pkt.sequence_num);
             }
-        } else if (received_pkt.header.type == PKT_EOT) {
-            printf("[SERVER] Recebido pacote de FIM DE TRANSMISSÃO.\n");
-            // Enviar ACK para EOT (opcional, dependendo do design)
-            ack_pkt.type = PKT_ACK;
-            ack_pkt.sequence_num = received_pkt.header.sequence_num; // Pode ser 0 ou 1, não importa
-            memcpy(ack_buffer, &ack_pkt, sizeof(ACKPacket));
 
-            sendto(sockfd, ack_buffer, sizeof(ACKPacket), 0,
-                   (const struct sockaddr *)&client_addr, addr_len);
-            printf("[SERVER] Enviado ACK para EOT.\n");
-            break; // Sair do loop principal
+        } else if (header->type == PKT_EOT) {
+            verbose_log("[SERVER] Recebido pacote de FIM DE TRANSMISSÃO.\n");
+            
+            // Enviar ACK para EOT
+            ACKPacket ack_pkt;
+            ack_pkt.type = PKT_ACK;
+            ack_pkt.sequence_num = header->sequence_num;
+            sendto(sockfd, &ack_pkt, sizeof(ACKPacket), 0, (const struct sockaddr *)&client_addr, addr_len);
+            verbose_log("[SERVER] Enviado ACK para EOT (seq: %d).\n", ack_pkt.sequence_num);
+
+            break; // Sair do loop
         }
     }
 
-    fclose(output_file);
+    if(output_file) fclose(output_file);
     close(sockfd);
 
     printf("\n--- Estatísticas do Servidor ---\n");
+    printf("Transferência finalizada.\n");
     printf("Total de pacotes de dados recebidos: %lld\n", total_packets_received);
     printf("Pacotes duplicados descartados: %lld\n", duplicate_packets);
-    printf("Arquivo 'received_file.txt' criado com sucesso.\n");
+    printf("Pacotes corrompidos descartados: %lld\n", corrupted_packets);
+    printf("-----------------------------------\n");
+
 
     return 0;
 }
