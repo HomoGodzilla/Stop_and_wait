@@ -1,4 +1,3 @@
-// server.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,9 +5,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <stdbool.h>
 #include <getopt.h>
-
+#include <stdarg.h>
 #include "protocol_defs.h"
 
 #define SERVER_PORT 12345

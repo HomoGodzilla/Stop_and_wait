@@ -43,11 +43,6 @@ typedef struct {
     uint8_t sequence_num;
 } ACKPacket;
 
-// Protótipos das funções auxiliares
-uint16_t calculate_checksum(const void *data, size_t length);
-void init_random();
-bool simulate_loss(double probability);
-
 // Implementações
 static inline uint16_t calculate_checksum(const void *data, size_t length) {
     uint32_t sum = 0;

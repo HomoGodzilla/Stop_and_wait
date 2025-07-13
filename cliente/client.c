@@ -1,4 +1,3 @@
-// client.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,14 +7,15 @@
 #include <unistd.h>
 #include <errno.h>
 #include <getopt.h>
-#include <libgen.h> // Para basename()
-
+#include <stdarg.h>
+#include <sys/time.h>
+#include <libgen.h>
 #include "protocol_defs.h"
 
 #define SERVER_IP "127.0.0.1"
 #define SERVER_PORT 12345
-#define TIMEOUT_SEC 2
-#define MAX_RETRIES 5
+#define TIMEOUT_SEC 1
+#define MAX_RETRIES 10
 
 // Variáveis globais para configuração
 bool verbose_mode = false;

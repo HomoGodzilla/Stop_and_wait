@@ -7,14 +7,10 @@ CC=gcc
 CFLAGS=-Wall -g
 
 # Alvos
-TARGETS=client server
+TARGETS= server
 
 # Regra principal
 all: $(TARGETS)
-
-# Regra para compilar o cliente
-client: client.c protocol_defs.h
-	$(CC) $(CFLAGS) -o client client.c
 
 # Regra para compilar o servidor
 server: server.c protocol_defs.h
